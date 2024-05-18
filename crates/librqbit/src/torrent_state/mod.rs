@@ -35,6 +35,8 @@ use tracing::error_span;
 use tracing::warn;
 
 use crate::chunk_tracker::ChunkTracker;
+use crate::events::TorrentEvent;
+use crate::events::TorrentEventKind;
 use crate::file_info::FileInfo;
 use crate::session::TorrentId;
 use crate::spawn_utils::BlockingSpawner;
@@ -208,6 +210,7 @@ impl ManagedTorrent {
         peer_rx: Option<PeerStream>,
         start_paused: bool,
         live_cancellation_token: CancellationToken,
+        event_tx: tokio::sync::broadcast::Sender<TorrentEvent>,
     ) -> anyhow::Result<()> {
         let mut g = self.locked.write();
 
@@ -273,7 +276,7 @@ impl ManagedTorrent {
             );
         }
 
-        match &g.state {
+        let r = match &g.state {
             ManagedTorrentState::Live(_) => {
                 bail!("torrent is already live");
             }
@@ -283,6 +286,7 @@ impl ManagedTorrent {
                 let t = self.clone();
                 let span = self.info().span.clone();
                 let token = live_cancellation_token.clone();
+                let event_tx = event_tx.clone();
                 spawn_with_cancel(
                     error_span!(parent: span.clone(), "initialize_and_start"),
                     token.clone(),
@@ -303,8 +307,12 @@ impl ManagedTorrent {
                                 }
 
                                 let (tx, rx) = tokio::sync::oneshot::channel();
-                                let live =
-                                    TorrentStateLive::new(paused, tx, live_cancellation_token)?;
+                                let live = TorrentStateLive::new(
+                                    paused,
+                                    tx,
+                                    live_cancellation_token,
+                                    event_tx,
+                                )?;
                                 g.state = ManagedTorrentState::Live(live.clone());
                                 t.state_change_notify.notify_waiters();
 
@@ -327,7 +335,12 @@ impl ManagedTorrent {
             ManagedTorrentState::Paused(_) => {
                 let paused = g.state.take().assert_paused();
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                let live = TorrentStateLive::new(paused, tx, live_cancellation_token.clone())?;
+                let live = TorrentStateLive::new(
+                    paused,
+                    tx,
+                    live_cancellation_token.clone(),
+                    event_tx.clone(),
+                )?;
                 g.state = ManagedTorrentState::Live(live.clone());
                 spawn_fatal_errors_receiver(self, rx, live_cancellation_token);
                 spawn_peer_adder(&live, peer_rx);
@@ -344,10 +357,22 @@ impl ManagedTorrent {
                 drop(g);
 
                 // Recurse.
-                self.start(peer_rx, start_paused, live_cancellation_token)
+                self.start(
+                    peer_rx,
+                    start_paused,
+                    live_cancellation_token,
+                    event_tx.clone(),
+                )
             }
             ManagedTorrentState::None => bail!("bug: torrent is in empty state"),
+        };
+        if r.is_ok() {
+            let _ = event_tx.send(TorrentEvent {
+                info_hash: self.info_hash(),
+                kind: TorrentEventKind::Started,
+            });
         }
+        r
     }
 
     pub fn is_paused(&self) -> bool {

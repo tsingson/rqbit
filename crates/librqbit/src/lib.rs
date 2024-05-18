@@ -30,6 +30,7 @@ mod api_error;
 mod chunk_tracker;
 mod create_torrent_file;
 mod dht_utils;
+pub mod events;
 pub mod file_info;
 mod file_ops;
 pub mod http_api;

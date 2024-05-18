@@ -82,6 +82,7 @@ use tracing::{debug, error, error_span, info, trace, warn};
 
 use crate::{
     chunk_tracker::{ChunkMarkingResult, ChunkTracker, HaveNeededSelected},
+    events::{TorrentEvent, TorrentEventKind},
     file_ops::FileOps,
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
@@ -184,6 +185,8 @@ pub struct TorrentStateLive {
 
     pub(crate) streams: Arc<TorrentStreams>,
     have_broadcast_tx: tokio::sync::broadcast::Sender<ValidPieceIndex>,
+
+    event_tx: tokio::sync::broadcast::Sender<TorrentEvent>,
 }
 
 impl TorrentStateLive {
@@ -191,6 +194,7 @@ impl TorrentStateLive {
         paused: TorrentStatePaused,
         fatal_errors_tx: tokio::sync::oneshot::Sender<anyhow::Error>,
         cancellation_token: CancellationToken,
+        event_tx: tokio::sync::broadcast::Sender<TorrentEvent>,
     ) -> anyhow::Result<Arc<Self>> {
         let (peer_queue_tx, peer_queue_rx) = unbounded_channel();
 
@@ -239,6 +243,7 @@ impl TorrentStateLive {
             up_speed_estimator,
             cancellation_token,
             have_broadcast_tx,
+            event_tx,
             streams: paused.streams,
             per_piece_locks: (0..lengths.total_pieces())
                 .map(|_| RwLock::new(()))
@@ -619,6 +624,11 @@ impl TorrentStateLive {
             chunk_tracker.mark_piece_broken_if_not_have(piece_id);
         }
 
+        let _ = self.event_tx.send(TorrentEvent {
+            info_hash: self.info_hash(),
+            kind: TorrentEventKind::Paused,
+        });
+
         // g.chunks;
         Ok(TorrentStatePaused {
             info: self.meta.clone(),
@@ -635,6 +645,10 @@ impl TorrentStateLive {
             .take()
             .context("fatal_errors_tx already taken")?;
         let res = anyhow::anyhow!("fatal error: {:?}", e);
+        let _ = self.event_tx.send(TorrentEvent {
+            info_hash: self.info_hash(),
+            kind: TorrentEventKind::Errored,
+        });
         if tx.send(e).is_err() {
             warn!("there's nowhere to send fatal error, receiver is dead");
         }
@@ -696,6 +710,10 @@ impl TorrentStateLive {
                 info!("torrent finished downloading");
             }
             self.finished_notify.notify_waiters();
+            let _ = self.event_tx.send(TorrentEvent {
+                info_hash: self.info_hash(),
+                kind: TorrentEventKind::Completed,
+            });
 
             if !self.has_active_streams_unfinished_files(&g) {
                 // There is not poing being connected to peers that have all the torrent, when
