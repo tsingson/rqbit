@@ -201,7 +201,6 @@ impl ManagedTorrent {
         };
 
         self.state_change_notify.notify_waiters();
-
         g.state = ManagedTorrentState::Error(error)
     }
 
@@ -303,6 +302,10 @@ impl ManagedTorrent {
                                 if start_paused {
                                     g.state = ManagedTorrentState::Paused(paused);
                                     t.state_change_notify.notify_waiters();
+                                    let _ = event_tx.send(TorrentEvent {
+                                        info_hash: t.info_hash(),
+                                        kind: TorrentEventKind::Paused,
+                                    });
                                     return Ok(());
                                 }
 
@@ -311,10 +314,14 @@ impl ManagedTorrent {
                                     paused,
                                     tx,
                                     live_cancellation_token,
-                                    event_tx,
+                                    event_tx.clone(),
                                 )?;
                                 g.state = ManagedTorrentState::Live(live.clone());
                                 t.state_change_notify.notify_waiters();
+                                let _ = event_tx.send(TorrentEvent {
+                                    info_hash: live.info_hash(),
+                                    kind: TorrentEventKind::Started,
+                                });
 
                                 spawn_fatal_errors_receiver(&t, rx, token);
                                 spawn_peer_adder(&live, peer_rx);
@@ -325,6 +332,10 @@ impl ManagedTorrent {
                                 let result = anyhow::anyhow!("{:?}", err);
                                 t.locked.write().state = ManagedTorrentState::Error(err);
                                 t.state_change_notify.notify_waiters();
+                                let _ = event_tx.send(TorrentEvent {
+                                    info_hash: t.info_hash(),
+                                    kind: TorrentEventKind::Errored,
+                                });
                                 Err(result)
                             }
                         }
