@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     dht_utils::{read_metainfo_from_peer_receiver, ReadMetainfoResult},
-    events::{TorrentEvent, TorrentEventKind},
+    events::{SessionEventBus, TorrentEvent, TorrentEventKind},
     merge_streams::merge_streams,
     peer_connection::PeerConnectionOptions,
     read_buf::ReadBuf,
@@ -111,7 +111,7 @@ pub struct Session {
 
     reqwest_client: reqwest::Client,
     connector: Arc<StreamConnector>,
-    event_tx: tokio::sync::broadcast::Sender<TorrentEvent>,
+    event_bus: SessionEventBus,
 
     // This is stored for all tasks to stop when session is dropped.
     _cancellation_token_drop_guard: DropGuard,
@@ -546,7 +546,7 @@ impl Session {
             };
 
             let stream_connector = Arc::new(StreamConnector::from(proxy_config));
-            let (event_tx, _) = tokio::sync::broadcast::channel(100);
+            let event_bus = SessionEventBus::new();
 
             let session = Arc::new(Self {
                 persistence,
@@ -564,7 +564,7 @@ impl Session {
                 default_storage_factory: opts.default_storage_factory,
                 reqwest_client,
                 connector: stream_connector,
-                event_tx,
+                event_bus,
             });
 
             if let Some(mut disk_write_rx) = disk_write_rx {
@@ -739,7 +739,7 @@ impl Session {
     }
 
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<TorrentEvent> {
-        self.event_tx.subscribe()
+        self.event_bus.subscribe()
     }
 
     /// Spawn a task in the context of the session.
@@ -1033,6 +1033,7 @@ impl Session {
             .allow_overwrite(opts.overwrite)
             .spawner(self.spawner)
             .trackers(trackers)
+            .event_bus(self.event_bus.new_torrent_bus(info_hash))
             .connector(self.connector.clone())
             .peer_id(self.peer_id);
 
@@ -1092,19 +1093,14 @@ impl Session {
             let _ = span.enter();
 
             managed_torrent
-                .start(
-                    peer_rx,
-                    opts.paused,
-                    self.cancellation_token.child_token(),
-                    self.event_tx.clone(),
-                )
+                .start(peer_rx, opts.paused, self.cancellation_token.child_token())
                 .context("error starting torrent")?;
         }
 
-        let _ = self.event_tx.send(TorrentEvent {
-            info_hash,
-            kind: TorrentEventKind::Added,
-        });
+        managed_torrent
+            .info()
+            .event_bus
+            .emit(TorrentEventKind::Added);
 
         Ok(AddTorrentResponse::Added(id, managed_torrent))
     }
@@ -1170,10 +1166,7 @@ impl Session {
 
         info!(id, "deleted torrent");
 
-        let _ = self.event_tx.send(TorrentEvent {
-            info_hash: removed.info_hash(),
-            kind: TorrentEventKind::Deleted,
-        });
+        removed.event_bus().emit(TorrentEventKind::Deleted);
 
         Ok(())
     }

@@ -35,7 +35,7 @@ use tracing::error_span;
 use tracing::warn;
 
 use crate::chunk_tracker::ChunkTracker;
-use crate::events::TorrentEvent;
+use crate::events::TorrentEventBus;
 use crate::events::TorrentEventKind;
 use crate::file_info::FileInfo;
 use crate::session::TorrentId;
@@ -114,6 +114,7 @@ pub struct ManagedTorrentInfo {
     pub span: tracing::Span,
     pub(crate) options: ManagedTorrentOptions,
     pub(crate) connector: Arc<StreamConnector>,
+    pub(crate) event_bus: TorrentEventBus,
 }
 
 pub struct ManagedTorrent {
@@ -133,6 +134,10 @@ impl ManagedTorrent {
 
     pub fn info(&self) -> &ManagedTorrentInfo {
         &self.info
+    }
+
+    pub fn event_bus(&self) -> &TorrentEventBus {
+        &self.info.event_bus
     }
 
     pub fn get_total_bytes(&self) -> u64 {
@@ -209,7 +214,6 @@ impl ManagedTorrent {
         peer_rx: Option<PeerStream>,
         start_paused: bool,
         live_cancellation_token: CancellationToken,
-        event_tx: tokio::sync::broadcast::Sender<TorrentEvent>,
     ) -> anyhow::Result<()> {
         let mut g = self.locked.write();
 
@@ -285,7 +289,6 @@ impl ManagedTorrent {
                 let t = self.clone();
                 let span = self.info().span.clone();
                 let token = live_cancellation_token.clone();
-                let event_tx = event_tx.clone();
                 spawn_with_cancel(
                     error_span!(parent: span.clone(), "initialize_and_start"),
                     token.clone(),
@@ -302,26 +305,16 @@ impl ManagedTorrent {
                                 if start_paused {
                                     g.state = ManagedTorrentState::Paused(paused);
                                     t.state_change_notify.notify_waiters();
-                                    let _ = event_tx.send(TorrentEvent {
-                                        info_hash: t.info_hash(),
-                                        kind: TorrentEventKind::Paused,
-                                    });
+                                    t.event_bus().emit(TorrentEventKind::Paused);
                                     return Ok(());
                                 }
 
                                 let (tx, rx) = tokio::sync::oneshot::channel();
-                                let live = TorrentStateLive::new(
-                                    paused,
-                                    tx,
-                                    live_cancellation_token,
-                                    event_tx.clone(),
-                                )?;
+                                let live =
+                                    TorrentStateLive::new(paused, tx, live_cancellation_token)?;
                                 g.state = ManagedTorrentState::Live(live.clone());
                                 t.state_change_notify.notify_waiters();
-                                let _ = event_tx.send(TorrentEvent {
-                                    info_hash: live.info_hash(),
-                                    kind: TorrentEventKind::Started,
-                                });
+                                t.event_bus().emit(TorrentEventKind::Started);
 
                                 spawn_fatal_errors_receiver(&t, rx, token);
                                 spawn_peer_adder(&live, peer_rx);
@@ -332,10 +325,7 @@ impl ManagedTorrent {
                                 let result = anyhow::anyhow!("{:?}", err);
                                 t.locked.write().state = ManagedTorrentState::Error(err);
                                 t.state_change_notify.notify_waiters();
-                                let _ = event_tx.send(TorrentEvent {
-                                    info_hash: t.info_hash(),
-                                    kind: TorrentEventKind::Errored,
-                                });
+                                t.event_bus().emit(TorrentEventKind::Errored);
                                 Err(result)
                             }
                         }
@@ -346,12 +336,7 @@ impl ManagedTorrent {
             ManagedTorrentState::Paused(_) => {
                 let paused = g.state.take().assert_paused();
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                let live = TorrentStateLive::new(
-                    paused,
-                    tx,
-                    live_cancellation_token.clone(),
-                    event_tx.clone(),
-                )?;
+                let live = TorrentStateLive::new(paused, tx, live_cancellation_token.clone())?;
                 g.state = ManagedTorrentState::Live(live.clone());
                 spawn_fatal_errors_receiver(self, rx, live_cancellation_token);
                 spawn_peer_adder(&live, peer_rx);
@@ -368,20 +353,12 @@ impl ManagedTorrent {
                 drop(g);
 
                 // Recurse.
-                self.start(
-                    peer_rx,
-                    start_paused,
-                    live_cancellation_token,
-                    event_tx.clone(),
-                )
+                self.start(peer_rx, start_paused, live_cancellation_token)
             }
             ManagedTorrentState::None => bail!("bug: torrent is in empty state"),
         };
         if r.is_ok() {
-            let _ = event_tx.send(TorrentEvent {
-                info_hash: self.info_hash(),
-                kind: TorrentEventKind::Started,
-            });
+            self.info.event_bus.emit(TorrentEventKind::Started);
         }
         r
     }
@@ -565,6 +542,7 @@ pub(crate) struct ManagedTorrentBuilder {
     storage_factory: BoxStorageFactory,
     disk_writer: Option<DiskWorkQueueSender>,
     connector: Arc<StreamConnector>,
+    event_bus: Option<TorrentEventBus>,
 }
 
 impl ManagedTorrentBuilder {
@@ -595,6 +573,7 @@ impl ManagedTorrentBuilder {
             storage_factory,
             disk_writer: None,
             connector: Arc::new(Default::default()),
+            event_bus: None,
         }
     }
 
@@ -638,6 +617,11 @@ impl ManagedTorrentBuilder {
         self
     }
 
+    pub fn event_bus(&mut self, event_bus: TorrentEventBus) -> &mut Self {
+        self.event_bus = Some(event_bus);
+        self
+    }
+
     pub fn disk_writer(&mut self, value: DiskWorkQueueSender) -> &mut Self {
         self.disk_writer = Some(value);
         self
@@ -648,7 +632,7 @@ impl ManagedTorrentBuilder {
         self
     }
 
-    pub fn build(self, span: tracing::Span) -> anyhow::Result<ManagedTorrentHandle> {
+    pub fn build(mut self, span: tracing::Span) -> anyhow::Result<ManagedTorrentHandle> {
         let lengths = Lengths::from_torrent(&self.info)?;
         let file_infos = self
             .info
@@ -683,6 +667,7 @@ impl ManagedTorrentBuilder {
                 disk_write_queue: self.disk_writer,
             },
             connector: self.connector,
+            event_bus: self.event_bus.take().context("event bus missing")?,
         });
 
         let initializing = Arc::new(TorrentStateInitializing::new(
