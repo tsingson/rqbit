@@ -1224,12 +1224,7 @@ impl Session {
             self.tcp_listen_port,
             handle.info().options.force_tracker_interval,
         )?;
-        handle.start(
-            peer_rx,
-            false,
-            self.cancellation_token.child_token(),
-            self.event_tx.clone(),
-        )?;
+        handle.start(peer_rx, false, self.cancellation_token.child_token())?;
         self.try_update_persistence_metadata(handle).await;
         Ok(())
     }
