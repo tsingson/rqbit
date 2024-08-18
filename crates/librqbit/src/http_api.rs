@@ -49,7 +49,7 @@ mod timeout {
 
     use crate::ApiError;
 
-    struct Timeout<const DEFAULT_MS: usize, const MAX_MS: usize>(pub Duration);
+    pub struct Timeout<const DEFAULT_MS: usize, const MAX_MS: usize>(pub Duration);
 
     #[async_trait::async_trait]
     impl<S, const DEFAULT_MS: usize, const MAX_MS: usize> axum::extract::FromRequestParts<S>
@@ -97,6 +97,8 @@ mod timeout {
         }
     }
 }
+
+use timeout::Timeout;
 
 impl HttpApi {
     pub fn new(api: Api, opts: Option<HttpApiOptions>) -> Self {
@@ -152,6 +154,7 @@ impl HttpApi {
         async fn torrents_post(
             State(state): State<ApiState>,
             Query(params): Query<TorrentAddQueryParams>,
+            Timeout(timeout): Timeout<60_000, 3_600_000>,
             data: Bytes,
         ) -> Result<impl IntoResponse> {
             let is_url = params.is_url;
@@ -178,7 +181,10 @@ impl HttpApi {
                 }
                 _ => AddTorrent::TorrentFileBytes(data.into()),
             };
-            state.api_add_torrent(add, Some(opts)).await.map(axum::Json)
+            tokio::time::timeout(timeout, state.api_add_torrent(add, Some(opts)))
+                .await
+                .context("timeout")?
+                .map(axum::Json)
         }
 
         async fn torrent_details(
@@ -249,18 +255,22 @@ impl HttpApi {
 
         async fn resolve_magnet(
             State(state): State<ApiState>,
+            Timeout(timeout): Timeout<60_000, 3_600_000>,
             url: String,
         ) -> Result<impl IntoResponse> {
-            let added = state
-                .session()
-                .add_torrent(
+            let added = tokio::time::timeout(
+                timeout,
+                state.session().add_torrent(
                     AddTorrent::from_url(&url),
                     Some(AddTorrentOptions {
                         list_only: true,
                         ..Default::default()
                     }),
-                )
-                .await?;
+                ),
+            )
+            .await
+            .context("timeout")??;
+
             let (info, content) = match added {
                 crate::AddTorrentResponse::AlreadyManaged(_, handle) => (
                     handle.info().info.clone(),
